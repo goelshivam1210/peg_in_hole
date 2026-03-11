@@ -5,13 +5,19 @@ Used by `simulation.py` when running:
 
     mjpython simulation.py --mode agent
 
-State machine:
-    1. move_above_peg   — move to safe height above peg
-    2. lower_to_peg     — descend to grip height
-    3. grip             — close fingers until force threshold or timeout
-    4. lift             — raise to safe travel height
-    5. move_above_hole  — translate over cuboid hole (XY only)
-    6. done             — hold position
+State machine (high level):
+    1. move_above_peg    — move to safe height above peg
+    2. lower_to_peg      — descend to grip height
+    3. grip              — light, force-controlled grasp near peg end
+    4. lift              — raise while maintaining that grasp
+    5. swing_to_vertical — let the peg swing under gravity toward vertical
+    6. regrip            — tighten the grasp once vertical
+    7. approach_hole     — move from peg region toward cuboid
+    8. move_above_hole   — move to a pose above the hole
+    9. fine_align        — center peg over hole in XY, lock alignment
+   10. lower_into_hole   — descend along hole axis
+   11. release           — open gripper and back off
+   12. done              — hold final pose
 
 Actuator note:
     ctrl=0   → fully open  (~85 mm jaw separation)
@@ -40,7 +46,7 @@ import numpy as np
 import mujoco
 
 
-# ── Actuator 
+# Actuator 
 
 CTRL_MIN = 0.0      # fully open
 CTRL_MAX = 255.0    # fully closed
@@ -56,8 +62,6 @@ def ctrl_to_jaw(ctrl: float) -> float:
     ctrl = float(np.clip(ctrl, CTRL_MIN, CTRL_MAX))
     return JAW_MAX * (1.0 - ctrl / CTRL_MAX)
 
-
-# ── Quaternion helpers ─────────────────────────────────────────────────────────
 
 def quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     """Multiply two quaternions [w, x, y, z]."""
@@ -77,20 +81,8 @@ def axis_angle_to_quat(axis: np.ndarray, angle: float) -> np.ndarray:
     h = angle / 2.0
     return np.array([np.cos(h), *(axis * np.sin(h))])
 
-def quat_conj(q: np.ndarray) -> np.ndarray:
-    return np.array([q[0], -q[1], -q[2], -q[3]])
 
-def quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Rotate 3D vector v by quaternion q (w,x,y,z)."""
-    vq = np.array([0.0, v[0], v[1], v[2]])
-    return quat_mul(quat_mul(q, vq), quat_conj(q))[1:]
-
-def wrap_pi(a: float) -> float:
-    """Wrap angle to [-pi, pi]."""
-    return (a + np.pi) % (2.0 * np.pi) - np.pi
-
-
-# ── Motion helper ──────────────────────────────────────────────────────────────
+# Motion helper
 
 def move_toward(current: np.ndarray, target: np.ndarray,
                 speed: float, dt: float) -> np.ndarray:
@@ -102,8 +94,6 @@ def move_toward(current: np.ndarray, target: np.ndarray,
     step = min(speed * dt, dist)
     return current + (delta / dist) * step
 
-
-# ── Contact force helper ───────────────────────────────────────────────────────
 
 def pad_peg_force(model: mujoco.MjModel, data: mujoco.MjData) -> float:
     """Return total normal-force magnitude between finger pads and peg."""
@@ -121,22 +111,7 @@ def pad_peg_force(model: mujoco.MjModel, data: mujoco.MjData) -> float:
     return total
 
 
-def peg_cuboid_force(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
-    """Net contact force vector between peg and cuboid (world frame)."""
-    total = np.zeros(3)
-    for i in range(data.ncon):
-        c = data.contact[i]
-        b1 = model.body(model.geom_bodyid[c.geom1]).name
-        b2 = model.body(model.geom_bodyid[c.geom2]).name
-        if (b1 == "peg" and b2 == "cuboid") or (b2 == "peg" and b1 == "cuboid"):
-            f = np.zeros(6)
-            mujoco.mj_contactForce(model, data, i, f)
-            total += f[:3]
-    return total
-
-
-# ── Agent ──────────────────────────────────────────────────────────────────────
-
+# Agent
 class PickPlaceAgent:
     """
     Simple 6-state pick-and-place agent.
@@ -161,7 +136,7 @@ class PickPlaceAgent:
         "done",
     ]
 
-    # ── Gripper orientation 
+    # Gripper orientation 
     # 180° around X so fingers point downward (-Z).
     Q_DOWN = np.array([0.0, 1.0, 0.0, 0.0])
     # Additional yaw so fingers approach peg from the side (about world Z).
@@ -170,7 +145,7 @@ class PickPlaceAgent:
     # Alias name used in state machine snippet.
     Q_GRIP = Q_GRASP
 
-    # ── Heights (m) — all relative to base_mount
+    # Heights (m) — all relative to base_mount
     Z_ABOVE  = 0.40    # safe travel height (clears cuboid top ~0.10 m)
     Z_GRIP   = 0.155   # grip height: pads at ~z=0.025, just above peg centre
     Z_LIFT   = 0.45    # ceiling for swing lift
@@ -178,35 +153,33 @@ class PickPlaceAgent:
     Z_INSERT = 0.04
     RELEASE_LIFT = 0.03  # extra height to lift gripper during release
 
-    # ── Jaw widths
+    # Jaw widths
     JAW_OPEN   = 0.085   # fully open
     JAW_CLOSED = 0.030   # nominal closed width on peg
     #   The force controller will stop closing when it hits the peg even if the
     #   command is narrower — so set this a bit tighter than peg width.
 
-    # ── Force control 
+    # Force control 
     GRIP_FORCE_TARGET       = 1.0   # N  — very light grip to let peg swing
     GRIP_FORCE_TARGET_HIGH  = 8.0   # N  — tighter grip once peg is vertical
     GRIP_CLOSE_RATE         = 0.03  # m/s — jaw closing speed
     RELEASE_OPEN_RATE       = 0.04  # m/s — how fast we open during release
     RELEASE_Z_RATE          = 0.01  # m/s — how fast we lower during release
-    ALIGN_YAW_RATE          = 0.8   # rad/s — max yaw correction speed in fine_align
-    ALIGN_YAW_TOL           = 0.10  # rad   — consider yaw aligned
     ALIGN_POS_TOL           = 0.003 # m     — tighter XY tolerance above hole
     ALIGN_TIMEOUT           = 1.5   # s
     INSERT_Z_RATE           = 0.02  # m/s — faster insertion descent
     INSERT_XY_GAIN          = 0.20  # unitless — stronger XY correction gain in insert state
     INSERT_XY_MAX_STEP      = 0.003 # m     — allow slightly larger XY correction per step
 
-    # ── Swing / geometry parameters
+    # Swing / geometry parameters
     GRIP_ALONG_OFFSET = 0.03   # m — offset along peg long axis X (closer to peg end)
     SWING_Z_STEP      = 0.002  # m per step to raise swing ceiling
     VERTICAL_THRESHOLD = 0.99  # peg long axis nearly vertical
 
-    # ── Motion speed 
-    SPEED = 0.03   # m/s — slower to reduce overshoot when moving to the hole
+    # Motion speed 
+    SPEED = 0.05   # m/s — slower to reduce overshoot when moving to the hole
 
-    # ── Position tolerance 
+    # Position tolerance 
     POS_TOL      = 0.008   # m — "close enough" for most transitions
     POS_TOL_FINE = 0.004   # m — tighter tolerance for lowering onto peg
 
@@ -384,24 +357,22 @@ class PickPlaceAgent:
                 self._advance()
 
         elif s == "fine_align":
-            # 1. Calculate the error between the PEG and the HOLE
+            # Center peg over hole in XY, then lock that XY for insertion.
             err_xy = cuboid_pos[:2] - peg_pos[:2]
-            
-            # 2. Adjust the gripper's target to close this gap
+
             tgt_pos = np.array([
                 cur_pos[0] + err_xy[0],
                 cur_pos[1] + err_xy[1],
-                self.Z_ABOVE
+                self.Z_ABOVE,
             ])
             tgt_quat = self.Q_GRIP
             jaw      = self._jaw_cmd
 
-            # 3. Wait until the PEG is perfectly centered, then lock the X/Y coordinates
             if np.linalg.norm(err_xy) < self.ALIGN_POS_TOL and self.state_t > 0.5:
                 self._aligned_xy = tgt_pos[:2].copy()
                 self._advance()
             elif self.state_t > self.ALIGN_TIMEOUT:
-                self._aligned_xy = tgt_pos[:2].copy() # Lock and proceed anyway
+                self._aligned_xy = tgt_pos[:2].copy()
                 self._advance()
 
         elif s == "lower_into_hole":
@@ -410,17 +381,12 @@ class PickPlaceAgent:
             tgt_quat = self.Q_GRIP
             jaw      = self._jaw_cmd
 
-            # Base XY at the locked aligned position from fine_align.
             xy = self._aligned_xy.copy()
-
-            # Optional small correction toward the true cuboid COM to reduce any
-            # residual XY error accumulated during motion.
             err_xy = cuboid_pos[:2] - xy
             dxy    = self.INSERT_XY_GAIN * err_xy
             dxy    = np.clip(dxy, -self.INSERT_XY_MAX_STEP, self.INSERT_XY_MAX_STEP)
             xy    += dxy
 
-            # Z descent
             z = float(cur_pos[2])
             z = max(float(self.Z_INSERT), z - self.INSERT_Z_RATE * dt)
 
@@ -455,8 +421,7 @@ class PickPlaceAgent:
 
         return tgt_pos, tgt_quat, jaw
 
-    # ── Private ────────────────────────────────────────────────────────────────
-
+    # Private 
     def _close_enough(self, current: np.ndarray,
                       target: np.ndarray, tol: float) -> bool:
         return float(np.linalg.norm(current - target)) < tol
