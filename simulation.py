@@ -133,7 +133,7 @@ def make_key_handler(data):
 
 def run(mode: str = "agent",
         log_path: str = "logs/run.json",
-        max_steps: int = 30000,
+        max_steps: int = 300000,
         time_scale: float = 1.0):
 
     model = mujoco.MjModel.from_xml_path(SCENE_PATH)
