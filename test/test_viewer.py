@@ -42,7 +42,7 @@ for i in range(model.nmesh):
     print(f"    size: {dims[0]:.4f} x {dims[1]:.4f} x {dims[2]:.4f} m")
     print()
 
-# ---- Inspect each body position ----
+# Inspect each body position 
 print("=== Body Positions ===")
 for i in range(model.nbody):
     name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)
